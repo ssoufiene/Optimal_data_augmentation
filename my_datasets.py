@@ -1,174 +1,209 @@
-import torch
-import torchvision
-import torchvision.transforms as transforms
-import numpy as np
+import os
+import glob
 from abc import ABC, abstractmethod
-from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from dataclasses import dataclass
 
-from config import DataRaterConfig
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader, random_split
 
-# --- 1. Configuration (Using a dataclass for clarity) ---
+import albumentations as A
+
+# ----------------------------
+# 1. Data corruption config
+# ----------------------------
 @dataclass
 class DataCorruptionConfig:
-    """Configuration for applying corruption to the training dataset."""
-    corruption_probability: float = 0.1 # Chance an image in the train set gets corrupted
-    corruption_fraction_range: tuple = (0.1, 0.9) # Min/Max corruption fraction if applied
+    corruption_probability: float = 0.1
+    corruption_fraction_range: tuple = (0.1, 0.9)
 
+# ----------------------------
+# 2. Class mappings
+# ----------------------------
+final_classes = {
+    'Sky': 0, 'Building': 1, 'Vehicle': 2, 'Vegetation': 3,
+    'Sign/Pole': 4, 'Ground': 5, 'Other': 6
+}
 
-# --- 2. Abstract Base Class for Datasets ---
+vkitti_rgb2final = {
+    (210, 0, 200): 'Ground',
+    (90, 200, 255): 'Sky',
+    (0, 199, 0): 'Vegetation',
+    (90, 240, 0): 'Vegetation',
+    (140, 140, 140): 'Building',
+    (100, 60, 100): 'Ground',
+    (250, 100, 255): 'Sign/Pole',
+    (255, 255, 0): 'Sign/Pole',
+    (200, 200, 0): 'Sign/Pole',
+    (255, 130, 0): 'Sign/Pole',
+    (80, 80, 80): 'Other',
+    (160, 60, 60): 'Vehicle',
+    (255, 127, 80): 'Vehicle',
+    (0, 139, 139): 'Vehicle',
+    (0, 0, 0): 'Other'
+}
+
+kitti_rgb2final = {
+    (128, 64, 128): 'Ground',
+    (244, 35, 232): 'Ground',
+    (70, 70, 70): 'Building',
+    (102, 102, 156): 'Building',
+    (190, 153, 153): 'Building',
+    (153, 153, 153): 'Sign/Pole',
+    (250, 170, 30): 'Sign/Pole',
+    (220, 220, 0): 'Sign/Pole',
+    (107, 142, 35): 'Vegetation',
+    (152, 251, 152): 'Vegetation',
+    (70, 130, 180): 'Sky',
+    (0, 0, 142): 'Vehicle',
+    (0, 0, 70): 'Vehicle',
+    (0, 60, 100): 'Vehicle',
+    (0, 80, 100): 'Vehicle',
+    (119, 11, 32): 'Vehicle',
+    (81, 0, 81): 'Ground',
+    (0, 0, 0): 'Other'
+}
+
+# ----------------------------
+# 3. Utility functions
+# ----------------------------
+def rgb_mask_to_class(mask_img, rgb_mapping, final_classes):
+    mask = np.array(mask_img)
+    h, w, _ = mask.shape
+    class_mask = np.zeros((h, w), dtype=np.uint8)
+    for rgb, cname in rgb_mapping.items():
+        class_id = final_classes[cname]
+        matches = np.all(mask == rgb, axis=-1)
+        class_mask[matches] = class_id
+    return class_mask
+
+def class_to_rgb(mask_np, class_to_color):
+    h, w = mask_np.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for class_id, color in class_to_color.items():
+        rgb[mask_np == class_id] = color
+    return rgb
+
+# ----------------------------
+# 4. Abstract dataset class
+# ----------------------------
 class DataRaterDataset(ABC):
-    """
-    Abstract base class for creating datasets compatible with the DataRater.
-    It defines a standard interface for getting data loaders and applying corruption.
-    """
-
     @abstractmethod
     def corrupt_samples(self, samples: torch.Tensor, corruption_fraction: float) -> torch.Tensor:
-        """
-        Applies a specified level of corruption to a batch of samples.
-
-        Args:
-            samples: A batch of samples to corrupt.
-            corruption_fraction: The fraction of pixels to alter.
-
-        Returns:
-            A new tensor containing the corrupted samples.
-        """
         pass
 
     @abstractmethod
-    def get_loaders(self, batch_size: int, train_split_ratio: float, train_corruption_config: DataCorruptionConfig) -> tuple:
-        """
-        Creates and returns the training, validation, and test data loaders.
-        The training loader should yield a mix of clean and corrupted data.
-
-        Args:
-            batch_size: The number of samples per batch.
-            train_split_ratio: The fraction of the training data to use for the inner loop.
-            train_corruption_config: Configuration for corrupting the training data.
-
-        Returns:
-            A tuple containing (train_loader, val_loader, test_loader).
-        """
+    def get_loaders(self, batch_size: int, train_split_ratio: float,
+                    train_corruption_config: DataCorruptionConfig) -> tuple:
         pass
 
-# --- 3. Custom Dataset Wrapper for On-the-Fly Corruption ---
+# ----------------------------
+# 5. Seg2Dataset (vkitti/kitti)
+# ----------------------------
+class Seg2Dataset(Dataset):
+    def __init__(self, image_dirs, mask_dirs, dataset_type='vkitti', size=(512, 256)):
+        print(f"[DEBUG] Initializing Seg2Dataset with dataset_type={dataset_type}")
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
+        if isinstance(mask_dirs, str):
+            mask_dirs = [mask_dirs]
 
-class CorruptedSubset(Dataset):
-    """
-    A wrapper for a PyTorch Subset that applies corruption to a portion of the
-    training data on-the-fly.
-    """
-    def __init__(self, original_subset: Subset, corruption_fn, config: DataCorruptionConfig):
-        self.original_subset = original_subset
-        self.corruption_fn = corruption_fn
-        self.config = config
+        self.size = size
+        self.dataset_type = dataset_type.lower()
+        self.image_paths, self.mask_paths = [], []
+
+        for img_dir, msk_dir in zip(image_dirs, mask_dirs):
+            print(f"[DEBUG] Checking directories: {img_dir}, {msk_dir}")
+            if not os.path.exists(img_dir):
+                raise FileNotFoundError(f"Image directory not found: {img_dir}")
+            if not os.path.exists(msk_dir):
+                raise FileNotFoundError(f"Mask directory not found: {msk_dir}")
+
+            imgs = sorted([p for ext in ('*.jpg','*.png') for p in glob.glob(os.path.join(img_dir, ext))])
+            msks = sorted([p for ext in ('*.jpg','*.png') for p in glob.glob(os.path.join(msk_dir, ext))])
+
+            print(f"[DEBUG] Found {len(imgs)} images and {len(msks)} masks in {img_dir}")
+            if len(imgs) == 0 or len(msks) == 0:
+                raise ValueError("No image or mask files found.")
+
+            self.image_paths.extend(imgs)
+            self.mask_paths.extend(msks)
+
+        assert len(self.image_paths) == len(self.mask_paths), "Mismatch image/mask count"
+
+        self.rgb_mapping = vkitti_rgb2final if self.dataset_type == "vkitti" else kitti_rgb2final
+        self.resize = A.Resize(height=size[1], width=size[0])
+        self.blur = A.GaussianBlur(blur_limit=(3,7), p=1.0)
+        self.cj = A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
+        self.rgb = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0)
 
     def __len__(self):
-        return len(self.original_subset)
+        return len(self.image_paths)
 
-    def __getitem__(self, index):
-        sample, label = self.original_subset[index]
+    def __getitem__(self, idx):
+        print(f"[DEBUG] Getting item {idx}")
+        img = np.array(Image.open(self.image_paths[idx]).convert("RGB"))
+        mask = Image.open(self.mask_paths[idx]).convert("RGB")
+        mask = mask.resize(self.size, Image.NEAREST)
+        mask_np = rgb_mask_to_class(np.array(mask), self.rgb_mapping, final_classes)
+        mask_t = torch.from_numpy(mask_np).long()
 
-        # Probabilistically decide whether to corrupt the sample
-        if torch.rand(1).item() < self.config.corruption_probability:
-            # Apply a random level of corruption within the specified range
-            corruption_fraction = torch.FloatTensor(1).uniform_(
-                self.config.corruption_fraction_range[0],
-                self.config.corruption_fraction_range[1]
-            ).item()
-            # The corruption function expects a batch, so we add a dimension and remove it
-            sample = self.corruption_fn(sample.unsqueeze(0), corruption_fraction).squeeze(0)
+        orig = self.resize(image=img)["image"]
 
-        return sample, label
+        if self.dataset_type == "vkitti":
+            v_orig = orig
+            v_blur = self.blur(image=orig)["image"]
+            v_cj = self.cj(image=orig)["image"]
+            v_rgb = self.rgb(image=orig)["image"]
+            variants = [v_orig, v_blur, v_cj, v_rgb]
+            variants_t = [torch.from_numpy(v.transpose(2,0,1)).float()/255.0 for v in variants]
+            return variants_t, mask_t
+        else:
+            img_t = torch.from_numpy(orig.transpose(2,0,1)).float()/255.0
+            return img_t, mask_t
 
-# --- 4. Concrete Implementation for MNIST ---
-class MNISTDataRaterDataset(DataRaterDataset):
-    """
-    An implementation of DataRaterDataset for the MNIST dataset.
-    - The training data loader provides a mix of clean and corrupted images.
-    - The validation and test loaders provide clean images.
-    """
+class MyDataset(DataRaterDataset):
+    def __init__(self, image_dirs, mask_dirs):
+        print("[DEBUG] Initializing MyDataset")
+        self.image_dirs = image_dirs
+        self.mask_dirs = mask_dirs
 
     def corrupt_samples(self, samples: torch.Tensor, corruption_fraction: float) -> torch.Tensor:
-        """
-        Corrupts a batch of images by REPLACING a fraction of pixels with random noise.
-        """
-        if corruption_fraction == 0.0:
-            return samples
+        return samples
 
-        corrupted_images = samples.clone()
-        # Ensure it works for single images (B, C, H, W) or batches
-        if len(samples.shape) == 3:
-            images = images.unsqueeze(0) # Add batch dimension if missing
+    def get_loaders(self, batch_size, train_split_ratio, train_corruption_config):
+        print("[DEBUG] Creating train_dataset")
+        train_dataset = Seg2Dataset(self.image_dirs, self.mask_dirs, dataset_type="vkitti", size=(512,256))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
-        batch_size, _, height, width = samples.shape
-        num_pixels_to_corrupt = int(corruption_fraction * (height * width))
+        print("[DEBUG] Creating val_test dataset")
+        val_test = Seg2Dataset("/content/kitti/training/image_2",
+                               "/content/kitti/training/semantic",
+                               dataset_type="kitti", size=(512,256))
+        size = len(val_test)//2
+        gen = torch.Generator().manual_seed(42)
+        val_split, test_split = random_split(val_test, [size, size], generator=gen)
 
-        for i in range(batch_size):
-            indices = torch.randperm(height * width, device=samples.device)[:num_pixels_to_corrupt]
-            row_indices, col_indices = indices // width, indices % width
-            random_pixels = torch.rand(num_pixels_to_corrupt, device=samples.device) * 2 - 1
-            corrupted_images[i, 0, row_indices, col_indices] = random_pixels
+        val_loader = DataLoader(val_split, batch_size=batch_size, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_split, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        return corrupted_images
-
-
-    def get_loaders(self, batch_size: int, train_split_ratio: float, train_corruption_config: DataCorruptionConfig) -> tuple:
-        """Prepares the correctly configured MNIST data loaders."""
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])
-
-        full_train_dataset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-        test_dataset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-
-        # Create a train/validation split from the ORIGINAL clean dataset
-        num_train = int(len(full_train_dataset) * train_split_ratio)
-        num_val = len(full_train_dataset) - num_train
-        train_subset, val_subset = random_split(full_train_dataset, [num_train, num_val])
-
-        # ** Wrap the training subset to apply corruption on-the-fly **
-        corrupted_train_dataset = CorruptedSubset(
-            original_subset=train_subset,
-            corruption_fn=self.corrupt_samples,
-            config=train_corruption_config
-        )
-
-        print(f"Train set: {len(corrupted_train_dataset)} images (probabilistically corrupted)")
-        print(f"Validation set: {len(val_subset)} images (clean)")
-        print(f"Test set: {len(test_dataset)} images (clean)")
-
-        # Create DataLoaders
-        train_loader = DataLoader(corrupted_train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False) # Validation data is CLEAN
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) # Test data is CLEAN
-
+        print("[DEBUG] DataLoaders created successfully")
         return train_loader, val_loader, test_loader
 
-# --- 5. Updated Factory Function ---
+# ----------------------------
+# 7. Loader function
+# ----------------------------
+def get_dataset_loaders(config):
+    print(f"[DEBUG] get_dataset_loaders called with dataset_name={config.dataset_name}")
+    image_dirs = ["/content/vkitti_rgb/Scene01/clone/frames/rgb/Camera_0"]
+    mask_dirs = ["/content/vkitti_gt/Scene01/clone/frames/classSegmentation/Camera_0/"]
 
-def get_dataset_loaders(config: DataRaterConfig) -> tuple:
-    """
-    Factory function to get the data loaders based on the configuration.
-
-    Args:
-        config: A DataRaterConfig object specifying the dataset and parameters.
-
-    Returns:
-        A tuple containing (train_loader, val_loader, test_loader).
-    """
-    if config.dataset_name == "mnist":
-        dataset_handler = MNISTDataRaterDataset()
-    elif config.dataset_name == "synthetic1":
-        dataset_handler = SyntheticRegressionDataset()
+    if config.dataset_name.lower() == "kitti":
+        dataset_handler = MyDataset(image_dirs, mask_dirs)
     else:
         raise ValueError(f"Dataset {config.dataset_name} not supported.")
 
-    return dataset_handler, dataset_handler.get_loaders(
-        config.batch_size,
-        config.train_split_ratio,
-        DataCorruptionConfig()
-    )
+    loaders = dataset_handler.get_loaders(config.batch_size, config.train_split_ratio, DataCorruptionConfig())
+    print("[DEBUG] Dataset loaders ready")
+    return dataset_handler, loaders
