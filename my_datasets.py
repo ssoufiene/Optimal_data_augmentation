@@ -145,7 +145,7 @@ class SegDataset(Dataset):
 
         img = np.array(Image.open(img_path).convert("RGB"))
         mask = Image.open(mask_path).convert("RGB")
-        mask = mask.resize((self.size[1],self.size[0]), Image.NEAREST)
+        mask = mask.resize((self.size), Image.NEAREST)
         mask_np = np.array(mask)
         mask_np = rgb_mask_to_class(mask_np, self.rgb_mapping, final_classes)
 
@@ -154,7 +154,7 @@ class SegDataset(Dataset):
         else:
             img_aug = img
 
-        img_t = torch.from_numpy(img_aug.transpose(2, 0, 1)).float() / 255.0
+        img_t = torch.from_numpy(img_aug.transpose(2, 1, 0)).float() / 255.0
         mask_t = torch.from_numpy(mask_np).long()
 
         return img_t, mask_t

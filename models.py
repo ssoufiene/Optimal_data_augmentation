@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-
+import albumentations as A
+import numpy as np 
 
 
 
@@ -162,6 +163,244 @@ def load_data_rater_from_checkpoint(checkpoint_path, device='cuda'):
     
     return model
 
+def train_k_top(model, train_loader, val_loader, best_augs_dict, 
+                num_epochs=15, lr=1e-3, device='cuda'):
+    model = model.to(device)
+    ce_loss = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    num_classes = 7
+    best_val_iou = 0.0
+    
+    # Define augmentations
+    blur = A.GaussianBlur(blur_limit=(3, 7), p=1.0)
+    cj = A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
+    rgb = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0)
+    
+    aug_dict = {
+        "original": lambda x: x,
+        "blur": lambda x: blur(image=x)["image"],
+        "colorjitter": lambda x: cj(image=x)["image"],
+        "rgbshift": lambda x: rgb(image=x)["image"]
+    }
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        
+        for batch_idx, (imgs, masks) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
+            imgs, masks = imgs.to(device), masks.to(device)
+            
+            # Apply best augmentation for each image in batch
+            augmented_imgs = torch.zeros_like(imgs)
+            for i in range(imgs.size(0)):
+                # Get the image index in the dataset
+                image_idx = batch_idx * train_loader.batch_size + i
+                
+                # Get the best augmentation for this image
+                aug_name = best_augs_dict.get(image_idx, "original")
+                
+                # Convert tensor to numpy, apply aug, convert back
+                img_np = (imgs[i].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                aug_fn = aug_dict[aug_name]
+                aug_img = aug_fn(img_np)
+                aug_tensor = torch.from_numpy(aug_img.transpose(2, 0, 1)).float() / 255.0
+                expected_shape = (3, 256, 512)
+                if aug_tensor.shape != expected_shape:
+                    raise ValueError(
+                        f"Augmented image has wrong shape {aug_tensor.shape}, expected {expected_shape} "
+                        f"(index={i}, augmentation={aug_name})"
+    )
+                augmented_imgs[i] = aug_tensor
+            
+            augmented_imgs = augmented_imgs.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(augmented_imgs)
+            loss = ce_loss(outputs, masks) + 0.5
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        model.eval()
+        val_loss = 0.0
+        iou_per_class = torch.zeros(num_classes, device=device)
+        eps = 1e-6
+
+        with torch.no_grad():
+            for imgs, masks in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                imgs, masks = imgs.to(device), masks.to(device)
+                outputs = model(imgs)
+                loss = ce_loss(outputs, masks)
+                val_loss += loss.item()
+
+                preds = torch.argmax(outputs, dim=1)
+
+                for cls in range(1, num_classes):
+                    pred_cls = preds == cls
+                    mask_cls = masks == cls
+                    intersection = torch.logical_and(pred_cls, mask_cls).sum().float()
+                    union = torch.logical_or(pred_cls, mask_cls).sum().float()
+                    iou_per_class[cls] += intersection / (union + eps)
+
+        val_loss /= len(val_loader)
+        mean_iou = (iou_per_class[1:] / len(val_loader)).mean().item()
+
+        print(f"Epoch {epoch+1:02d}: Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | Val mIoU={mean_iou:.4f}")
+
+    print("Training complete.")
+
+def train_dk_top_debug(model, train_loader, val_loader, best_augs_dict, 
+                      num_epochs=15, lr=1e-3, device='cuda'):
+    import torch.nn as nn
+    import torch.optim as optim
+    import albumentations as A
+    from tqdm import tqdm
+
+    model = model.to(device)
+    ce_loss = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    num_classes = 7
+
+    # Define augmentations
+    blur = A.GaussianBlur(blur_limit=(3, 7), p=1.0)
+    cj = A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
+    rgb = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0)
+
+    aug_dict = {
+        "original": lambda x: x,
+        "blur": lambda x: blur(image=x)["image"],
+        "colorjitter": lambda x: cj(image=x)["image"],
+        "rgbshift": lambda x: rgb(image=x)["image"]
+    }
+
+    first_batch_debug_done = False
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+
+        for batch_idx, (imgs, masks) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
+            imgs, masks = imgs.to(device), masks.to(device)
+
+            # Apply best augmentation for each image in batch
+            augmented_imgs = torch.zeros_like(imgs)
+
+            for i in range(imgs.size(0)):
+                # Compute dataset index (make sure DataLoader is not shuffled!)
+                image_idx = batch_idx * train_loader.batch_size + i
+
+                # Get the best augmentation for this image
+                aug_name = best_augs_dict.get(image_idx, "original")
+
+                # Convert tensor to numpy, apply augmentation, convert back
+                img_np = (imgs[i].cpu().numpy() * 255).astype(np.uint8).transpose(1, 2, 0)
+                aug_fn = aug_dict[aug_name]
+                aug_img = aug_fn(img_np)
+                aug_tensor = torch.from_numpy(aug_img.transpose(2, 0, 1)).float() / 255.0
+
+                # Shape check
+                expected_shape = (3, 256, 512)
+                if aug_tensor.shape != expected_shape:
+                    raise ValueError(
+                        f"Augmented image has wrong shape {aug_tensor.shape}, expected {expected_shape} "
+                        f"(index={image_idx}, augmentation={aug_name})"
+                    )
+
+                augmented_imgs[i] = aug_tensor
+
+                # --- Debug prints for first batch only ---
+                if not first_batch_debug_done:
+                    mean_before = imgs[i].mean().item()
+                    std_before = imgs[i].std().item()
+                    mean_after = aug_tensor.mean().item()
+                    std_after = aug_tensor.std().item()
+                    print(f"[DEBUG] image_idx={image_idx}, aug={aug_name}")
+                    print(f"        shape_before={imgs[i].shape}, shape_after={aug_tensor.shape}")
+                    print(f"        mean_before={mean_before:.4f}, std_before={std_before:.4f}")
+                    print(f"        mean_after = {mean_after:.4f}, std_after = {std_after:.4f}")
+
+            first_batch_debug_done = True  # only debug first batch
+
+            augmented_imgs = augmented_imgs.to(device)
+            optimizer.zero_grad()
+            outputs = model(augmented_imgs)
+            loss = ce_loss(outputs, masks) + 0.5  # keep your extra term
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        iou_per_class = torch.zeros(num_classes, device=device)
+        eps = 1e-6
+
+        with torch.no_grad():
+            for imgs, masks in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+                imgs, masks = imgs.to(device), masks.to(device)
+                outputs = model(imgs)
+                loss = ce_loss(outputs, masks)
+                val_loss += loss.item()
+
+                preds = torch.argmax(outputs, dim=1)
+
+                for cls in range(1, num_classes):
+                    pred_cls = preds == cls
+                    mask_cls = masks == cls
+                    intersection = torch.logical_and(pred_cls, mask_cls).sum().float()
+                    union = torch.logical_or(pred_cls, mask_cls).sum().float()
+                    iou_per_class[cls] += intersection / (union + eps)
+
+        val_loss /= len(val_loader)
+        mean_iou = (iou_per_class[1:] / len(val_loader)).mean().item()
+
+        print(f"Epoch {epoch+1:02d}: Train Loss={train_loss:.4f} | Val Loss={val_loss:.4f} | Val mIoU={mean_iou:.4f}")
+
+    print("Training complete.")
+
+
+def evaluate_segmentation(model, dataloader, num_classes=7, device='cuda', eps=1e-6):
+    """
+    Evaluate a segmentation model on a given dataloader.
+
+    Args:
+        model: PyTorch segmentation model
+        dataloader: DataLoader providing (images, masks)
+        num_classes: number of segmentation classes
+        device: 'cuda' or 'cpu'
+        eps: small epsilon to avoid division by zero
+
+    Returns:
+        iou_per_class: Tensor of IoU per class
+        mean_iou: Mean IoU across classes
+    """
+    model.to(device)
+    model.eval()
+    iou_per_class = torch.zeros(num_classes, device=device)
+
+    with torch.no_grad():
+        for imgs, masks in tqdm(dataloader):
+            imgs, masks = imgs.to(device), masks.to(device)
+            outputs = model(imgs)
+            preds = torch.argmax(outputs, dim=1)
+
+            for cls in range(num_classes):
+                pred_cls = preds == cls
+                mask_cls = masks == cls
+
+                intersection = torch.logical_and(pred_cls, mask_cls).sum().float()
+                union = torch.logical_or(pred_cls, mask_cls).sum().float()
+                iou_per_class[cls] += intersection / (union + eps)
+
+    # Average IoU per class
+    iou_per_class /= len(dataloader)
+    mean_iou = iou_per_class.mean().item()
+
+    return iou_per_class, mean_iou
 
 def construct_model(model_class):
     if model_class == 'unet':
