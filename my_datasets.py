@@ -69,6 +69,96 @@ class DataRaterDataset(ABC):
         pass
 
 
+
+class SegDataset(Dataset):
+    def __init__(self, image_dirs, mask_dirs, dataset_type='vkitti', aug_case=None, size=(512, 256)):
+        """
+        image_dirs: str or list of str paths to image folders
+        mask_dirs: str or list of str paths to mask folders
+        """
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
+        if isinstance(mask_dirs, str):
+            mask_dirs = [mask_dirs]
+
+        self.image_paths = []
+        self.mask_paths = []
+
+        for img_dir, msk_dir in zip(image_dirs, mask_dirs):
+            img_files = sorted([p for ext in ('*.jpg', '*.png') for p in glob.glob(os.path.join(img_dir, ext))])
+            msk_files = sorted([p for ext in ('*.jpg', '*.png') for p in glob.glob(os.path.join(msk_dir, ext))])
+            self.image_paths.extend(img_files)
+            self.mask_paths.extend(msk_files)
+
+        if len(self.image_paths) != len(self.mask_paths):
+            raise ValueError("Number of images and masks must match across all folders.")
+
+        self.size = size
+        self.aug_case = aug_case
+        self.transform = self.get_augmentations(aug_case)
+        self.dataset_type = dataset_type.lower()
+
+        if self.dataset_type == 'vkitti':
+            self.rgb_mapping = vkitti_rgb2final
+        elif self.dataset_type == 'kitti':
+            self.rgb_mapping = kitti_rgb2final
+        else:
+            raise ValueError("dataset_type must be 'vkitti' or 'kitti'")
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def get_augmentations(self, case):
+        """Photometric augmentations applied only to images."""
+        if case is None:
+            return A.Resize(*self.size)
+        if case == 'CJ':
+            return A.Compose([
+                A.Resize(*self.size),
+                A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
+            ])
+        elif case == 'RGBS':
+            return A.Compose([
+                A.Resize(*self.size),
+                A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.5),
+            ])
+        elif case == 'BLUR':
+            return A.Compose([
+                A.Resize(*self.size),
+                A.GaussianBlur(blur_limit=(3,7), p=0.5),
+            ])
+        elif case == 'EQUAL':
+            return A.Compose([
+                A.Resize(*self.size),
+                A.OneOf([
+                    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0),
+                    A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0),
+                    A.GaussianBlur(blur_limit=(3,7), p=1.0),
+                ], p=1.0),
+            ])
+        else:
+            raise ValueError("Invalid augmentation case. Choose from 'CJ','RGBS','BLUR','EQUAL'")
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self.mask_paths[idx]
+
+        img = np.array(Image.open(img_path).convert("RGB"))
+        mask = Image.open(mask_path).convert("RGB")
+        mask = mask.resize((self.size[1],self.size[0]), Image.NEAREST)
+        mask_np = np.array(mask)
+        mask_np = rgb_mask_to_class(mask_np, self.rgb_mapping, final_classes)
+
+        if self.transform:
+            img_aug = self.transform(image=img)['image']
+        else:
+            img_aug = img
+
+        img_t = torch.from_numpy(img_aug.transpose(2, 0, 1)).float() / 255.0
+        mask_t = torch.from_numpy(mask_np).long()
+
+        return img_t, mask_t
+
 class Seg2Dataset(Dataset):
     def __init__(self, image_dirs, mask_dirs, dataset_type='vkitti', size=(512, 256)):
         if isinstance(image_dirs, str):
