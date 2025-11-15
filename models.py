@@ -31,15 +31,16 @@ class DataRater(nn.Module):
     def __init__(self, temperature=1.0):
         super(DataRater, self).__init__()
         self.layers = nn.Sequential(
-            nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3),
+            nn.Conv2d(in_channels=3, out_channels=8, kernel_size=3),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3),
             nn.Tanh(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.AdaptiveAvgPool2d(1),  
             nn.Flatten()
         )
-        self.head = nn.Linear(400, 1)
+        self.head = nn.Linear(16, 1)
         self.temperature = temperature
 
     def forward(self, x):
@@ -118,7 +119,7 @@ class SimpleSegNet(nn.Module):
 
 def construct_model(model_class):
     if model_class == 'unet':
-      return SimpleSegNet
+      return SimpleSegNet()
     if model_class == 'ToyCNN':
         return ToyCNN()
     elif model_class == 'DataRater':

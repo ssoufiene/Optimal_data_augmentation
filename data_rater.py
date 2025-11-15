@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 
 from models import construct_model
 from config import DataRaterConfig
-from datasets import get_dataset_loaders
+from my_datasets import get_dataset_loaders
 
 @dataclass
 class LoggingContext:
@@ -64,10 +64,10 @@ def inner_unroll_differentiable(
     for _ in range(T):
         # Get next batch (wrap iterator if needed)
         try:
-            inner_samples, inner_labels = next(train_iterator)
+            inner_samples, inner_labels,_ = next(train_iterator)
         except StopIteration:
             train_iterator = iter(train_loader)
-            inner_samples, inner_labels = next(train_iterator)
+            inner_samples, inner_labels, _ = next(train_iterator)
 
         inner_samples = inner_samples.to(config.device)
         inner_labels = inner_labels.to(config.device)
@@ -89,8 +89,11 @@ def inner_unroll_differentiable(
             per = nn.functional.cross_entropy(logits, inner_labels, reduction='none')  # [B]
         else:
             raise ValueError(f"Loss type {config.loss_type} not supported")
+        per = per.view(per.size(0), -1).mean(dim=1)  # shape [B]
+
 
         # Weight across the batch; use sum (weights already sum to 1)
+       
         inner_loss = (per * weights).sum()
 
         # Compute grads wrt fast params (keep graph to backprop into η via weights)
@@ -114,6 +117,8 @@ def inner_unroll_differentiable(
         }
 
     return fast_params, train_iterator
+
+
 
 
 # --- Outer step using differentiable inner unroll ---
