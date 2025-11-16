@@ -38,5 +38,6 @@ This repository implements a meta-learning approach to automatically discover op
 
 ## Results
 ![mean_iou](mean_iou.png)
-
+see the included Jupyter notebook with examples and visualizations:  
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/14xcN3vexCj9uDiD9FHTGa5_PTZEL0X5A?usp=sharing)
 
