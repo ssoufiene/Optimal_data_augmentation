@@ -35,7 +35,6 @@ def analyze_with_individual_augmentations(
     print(f"\n--- Individual Augmentation Analysis (MetaStep: {current_step}) ---")
     data_rater.eval()
 
-    # Albumentations augmentations
     blur = A.GaussianBlur(blur_limit=(3, 7), p=1.0)
     cj = A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
     rgb = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0)
@@ -87,7 +86,6 @@ def analyze_with_individual_augmentations(
             best_augmentations[image_counter] = best_aug
             image_counter += 1
 
-    # Scatter plot
     plt.figure(figsize=(14, 8))
     colors = {'original': 'blue', 'blur': 'red', 'colorjitter': 'green', 'rgbshift': 'orange'}
 
@@ -106,7 +104,6 @@ def analyze_with_individual_augmentations(
     plt.tight_layout()
     plt.show()
 
-    # Stats summary
     print("\nAugmentation Score Statistics:")
     print("-" * 60)
     stats_dict = {}
@@ -124,7 +121,6 @@ def analyze_with_individual_augmentations(
         print(f"  {i}. {aug_name:15s}: {s['mean']:7.4f}")
     print("-" * 60)
 
-    # Save best augmentations
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, f"best_augmentations.pt")
@@ -139,7 +135,6 @@ def visualize_samples_with_scores(
     print(f"\n--- Visualizing {num_samples} Samples (MetaStep={current_step}) ---")
     data_rater.eval()
 
-    # Albumentations
     blur = A.GaussianBlur(blur_limit=(3, 7), p=1.0)
     cj = A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=1.0)
     rgb = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=1.0)
@@ -152,7 +147,6 @@ def visualize_samples_with_scores(
     }
     aug_order = list(augmentations.keys())
 
-    # Collect all images from all batches
     images = []
     for img_batch, _ in data_loader:
         for i in range(img_batch.size(0)):
@@ -165,11 +159,10 @@ def visualize_samples_with_scores(
     samples = []
 
     for img in selected_imgs:
-        # img shape: (1, 3, 256, 512)
-        # Transpose to (1, 3, 512, 256) for landscape
-        img = img.permute(0, 1, 3, 2)  # Swap last two dims
+        
+        img = img.permute(0, 1, 3, 2)  
         img_np = (img[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-        # img_np shape: (512, 256, 3)
+        
         
         sample_dict = {"images": {}, "scores": {}}
 
